@@ -1,0 +1,458 @@
+---
+title: "ST308"
+output: html_document
+---
+
+
+This R Markdown file contains the code necessary to carry out every part of the ST308 project.
+
+
+We begin by initialising the session by loading all the necessary packages and setting the default seed
+```{r}
+rm(list = ls())
+#load necessary packages
+packages <- c("dplyr","rstan", "ggplot2", "reshape2", "gridExtra", "moments", "bayesplot", "loo")
+lapply(packages, require, character.only = TRUE)
+rm(packages)
+
+#set the seed
+SEED <- as.integer(20210506)
+```
+
+we will proceed to load the data into the R session. Notably, we will remove any information regarding the reviews of the property. This is since we do not have complete information on the reviews, e.g. we do not know whether those reviews are positive or negative. Any interpretation of those variables may lack context and mislead.
+```{r}
+#create an empty list of dataframes
+df <- read.csv("listings.csv")
+
+#remove columns/variables that are unnecessary for the analysis
+to.remove <- c("neighbourhood_group",
+               "name",
+               "host_name",
+               "number_of_reviews",
+               "last_review",
+               "reviews_per_month")
+df <- df[,!(colnames(df) %in% to.remove)]
+
+#remove all rows with NA
+df <- na.omit(df)
+```
+
+
+Now we begin preparing the data. Namely, want to:
+- reduce too many groups in factors in the level 2 to avoid high computational burden
+- rename and re-index the data for easier access of data
+
+```{r}
+#subset the data for only hosts who own at least 3 properties in the data
+ownsManyProperty <- names(table(df$host_id)[table(df$host_id) >= 3])
+df <- df[df$host_id %in% ownsManyProperty,]
+
+#subset data for only properties that belong to 20 randomly chosen hosts
+set.seed(SEED)
+host.freq <- table(df$host) #call list for the count for car model
+host.vec <- names(host.freq) #call the vector of all names of all car models
+
+#randomly sample 20 hosts with likelihood proportional to their frequency
+random.hosts <- sample(names(host.freq), 20, prob = host.freq)
+df <- df[df$host %in% random.hosts,]
+
+# #reduce the specificity in the unit of measurement in the date of last review to reduce number of factor groups
+# df$last_review <- sapply(df$last_review, substring, first=1, last=4)
+
+#replace the row index of the data with the property_id after re-ordering
+df <- df[order(df$host_id),]
+row.names(df) <- 1:nrow(df)   
+
+#rename the columns (personal preference)
+df <- df %>% rename(host = host_id,
+                    roomType = room_type,
+                    minNights = minimum_nights,
+                    # numReviews = number_of_reviews,
+                    # lastReviewDate = last_review,
+                    # reviewsPerMonth = reviews_per_month,
+                    hostListingsCount = calculated_host_listings_count,
+                    numDaysAvailable = availability_365)
+```
+
+
+We will be working with price log-transformed as the main outcome variable due to the skewness that
+the distribution of price itself exhibits
+
+```{r}
+#create a column for log-transformed of outcome variable
+df$logPrice <- log(df$price)
+
+#compare the skewness of price and skewness of log-price (illustrative purpose)
+print(paste("skewness of price is", skewness(df$price)))
+print(paste("skewness of log-price is", skewness(df$logPrice)))
+
+#plot the density of the distributions (illustrative purpose)
+#create temporary dataframe for creating plots
+price_df <- melt(data.frame(price = scale(df$price),
+                            logPrice = scale(df$logPrice)))
+
+#create temporary dataframe for median by group
+price_median <- data.frame(tapply(price_df$value, price_df$variable, median))
+names(price_median) <- c('median')
+price_median$variable <- rownames(price_median)
+
+#create density & histogram plots
+price_plot <- ggplot(data = price_df, aes(x = value, fill = variable)) +
+  geom_histogram(aes(y = ..density..),
+                 position = "identity",
+                 alpha = 0.2,
+                 bins = 60,
+                 color = "grey") +
+  geom_vline(data = price_median,
+             aes(xintercept=median, col = variable),
+             linetype = "dashed",
+             size = 0.8) +
+  stat_function(fun = dnorm,
+                n = 100,
+                args = list(mean=0, sd=1),
+                aes(color = "Std. Normal"),
+                linetype = "solid",
+                size = 0.7) +
+  geom_vline(aes(xintercept=0),
+             linetype = 'dashed',
+             size = 0.8) +
+  scale_color_manual("", values = c("#00BFC4", "#F8766D","black")) +
+  xlab("z-score") +
+  ylab("Probability Density") +
+  labs(fill = "median") +
+  ggtitle("Distribution of Car Price and Log of Car Price (standardised)") +
+  theme_bw() +
+  theme(legend.position = c(0.75, 0.7),
+        legend.background = element_rect(fill = alpha("grey",0.5), colour = "black"),
+        legend.key = element_rect(fill = "transparent"),
+        panel.border = element_rect(colour = "black", fill = NA)) +
+  guides(color = guide_legend("median"), fill = FALSE)
+
+
+rm(price_median)
+rm(price_df)
+price_plot
+
+
+#remove unnecessary columns and reorder the dataframe such that outcome variable comes first
+df <- df[c("logPrice", setdiff(names(df), c("price", "logPrice", "id")))]
+
+```
+
+
+Now we group the predictor variables by whether it is continuous or categorical and by which level in the data it belongs to. Also, we convert the the variables into its appriopriate form, i.e. standardise continuous variables for greater computational efficiency and categorical variables into factors.
+
+```{r}
+#identify the continuous explanatory variables and create a list for them,
+#grouped by their relevance to the multilevel structure
+cont.predictors <- list(lv1 = c("minNights",
+                                # "numReviews",
+                                # "reviewsPerMonth",
+                                "numDaysAvailable"),
+                        lv1.poly = c("latitude",
+                                     "longitude"),
+                        lv2 = c("hostListingsCount"))
+
+#identify the continuous explanatory variables and create a list for them,
+#grouped by their relevance to the multilevel structure
+category.predictors <- list(lv1 = c("neighbourhood",
+                                    # "lastReviewDate",
+                                    "roomType"),
+                            lv2.id = c("host"))
+
+#standardize continuous explanatory variables
+all.cont.predictors <- unlist(cont.predictors, use.names = F)
+df[all.cont.predictors] <- scale(df[all.cont.predictors])
+
+#convert categorical explanatory variables to factors
+all.category.predictors <- unlist(category.predictors, use.names = F)
+df[all.category.predictors] <- lapply(df[all.category.predictors], as.factor)
+
+```
+
+Now we begin by considering a pooled linear regression model and we prepare all the necessary objects to construct the data list for the stan fit input. We will specifically add 5th order polynomials for longitude and latitude to represent the possibly complicated relationship they exhibit
+
+```{r}
+#subset the data to exclude the host-level related variables
+pooled.df <- subset(df, select = -c(host, hostListingsCount))
+
+#define the model specification for the pooled model
+cont.predictors.spec <- paste(cont.predictors[["lv1"]],collapse = " + ")
+#add 5th order polynomials for longitude and latitude
+cont.poly.predictors.spec <- paste("poly(",cont.predictors[["lv1.poly"]],", degree = 5)",collapse = " + ")
+category.predictors.spec <- paste(category.predictors[["lv1"]], collapse = " + ")
+
+#concatenate all the necessary regressors into a formula to represent the model
+pooled.model.spec <- paste("logPrice",cont.predictors.spec, sep = " ~ ")
+pooled.model.spec <- paste(pooled.model.spec, cont.poly.predictors.spec, sep = " + ")
+pooled.model.spec <- paste(pooled.model.spec, category.predictors.spec, sep = " + ")
+pooled.model.spec <- as.formula(pooled.model.spec)
+
+#create the X matrix for the model
+pooled.X <- model.matrix(pooled.model.spec, data = pooled.df)
+
+#specify the inverse of (XtX)
+XtX <- t(pooled.X) %*% pooled.X
+inv.XtX <- solve(XtX)
+#round the matrix such that the matrix maintains symmetry without any float issues
+#(may need to reduce the number of decimal digits if it is not symmetric)
+inv.XtX <- round(inv.XtX, digits = 8)
+```
+
+Now we run and fit the pooled model using R stan
+
+```{r}
+#define the data list as input for R stan
+pooled.data <- list(N = dim(pooled.X)[1],
+                    K = dim(pooled.X)[2],
+                    log_y = pooled.df$logPrice,
+                    X = pooled.X,
+                    mu_0 = rep(0, dim(pooled.X)[2]))
+
+#specify the extra list to input the inverted matrix
+inv.XtX.list <- list(inv_XtX = inv.XtX)
+unit.info.pooled.data <- c(pooled.data, inv.XtX.list)
+rm(inv.XtX.list)
+
+#fit using MCMC via R stan
+pooled.fit <- stan(file = 'pooled_unit_info.stan',
+                   data = unit.info.pooled.data,
+                   init = 0,
+                   chains = 4,
+                   cores = 4,
+                   iter = 3000,
+                   warmup = 2000,
+                   seed = SEED)
+
+#rename parameter output 
+# names(pooled.fit)[1:dim(pooled.X)[2]] <- colnames(pooled.X)
+
+
+extract.pooled.fit <- extract(pooled.fit)
+
+```
+
+
+Run a ridge regression fit using R stan
+
+```{r}
+#fit using MCMC via R stan
+ridge.fit <- stan(file = 'pooled_ridge.stan',
+                  data = pooled.data,
+                  init = 0,
+                  chains = 4,
+                  cores = 4,
+                  iter = 3000,
+                  warmup = 2000,
+                  seed = SEED)
+
+extract.ridge.fit <- extract(ridge.fit)
+
+```
+
+flat prior for variance
+
+```{r}
+
+#fit using MCMC via R stan
+flat.fit <- stan(file = 'pooled_flat.stan',
+                  data = pooled.data,
+                  init = 0,
+                  chains = 4,
+                  cores = 4,
+                  iter = 3000,
+                  warmup = 2000,
+                  seed = SEED)
+
+extract.flat.fit <- extract(flat.fit)
+
+```
+
+Create combo plot to show convergence in sampling
+
+```{r}
+
+color_scheme_set("mix-red-blue")
+pooled.combo <- mcmc_combo(pooled.fit, 
+                           pars = c("(Intercept)", "sigma2"),
+                           combo = c("dens_overlay", "trace"),
+                           widths = c(2, 3))
+
+#add title to figure
+#save 8 inch * 3 inch
+
+pooled.combo
+
+```
+
+
+create density plot to compare fitted values to actual sample for the pooled model
+```{r}
+#randomly choose 4*100 fitted value points (post-warmup) to show on the density plot
+set.seed(SEED)
+random.indices <- sample(3001:4000, 50)
+
+#create overlay density plots
+pooled.fitted.density <- ppc_dens_overlay(y = df$logPrice,
+                                          yrep = extract.pooled.fit$log_y_hat[random.indices,]) 
+
+average.fitted.density <- apply(extract.pooled.fit$log_y_hat[3001:4000,],
+                                MARGIN = 2,
+                                mean)
+
+#edit plot features
+pooled.fitted.density <- pooled.fitted.density +
+                         xlab("Log of Price") +
+                         ylab("probability density") +
+                         legend_move(c(0.85, 0.5))
+
+pooled.fitted.density
+
+#save 8 inch * 4 inch
+
+```
+
+
+
+```{r}
+
+#create custom function to extract the names of the parameters that we want to show on figure
+wanted.parameters <- function(vec){
+  parameter.names <- names(vec)
+  end.index <- match("log_y_hat[1]", parameter.names)-1
+  to.return <- parameter.names[1:end.index]
+  return(to.return)
+}
+
+
+color_scheme_set("red")
+pooled.interval <- mcmc_intervals(pooled.fit, 
+                                  pars = wanted.parameters(pooled.fit),
+                                  point_est = "mean",
+                                  point_size = 1.5,
+                                  prob = 0.5,
+                                  prob_outer = 0.95) +                  
+                 theme(axis.title.y = element_blank(),
+                       axis.text.y = element_text(size=7),
+                       plot.title = element_text(size = 10, hjust = 0.5)) + 
+                 ggtitle("Model A")
+
+
+
+color_scheme_set("blue")
+ridge.interval <- mcmc_intervals(ridge.fit, 
+                                 pars = setdiff(wanted.parameters(ridge.fit), "lambda"),
+                                 point_est = "mean",
+                                 point_size = 1.5,
+                                 prob = 0.5,
+                                 prob_outer = 0.95) + 
+                  theme(axis.title.y = element_blank(),
+                        axis.text.y = element_blank(),
+                        axis.ticks.y = element_blank(),
+                        plot.title = element_text(size = 10, hjust = 0.5)) +                    
+                  ggtitle("Model B") +
+                  xlim(-11, 11)
+
+
+color_scheme_set("green")
+flat.interval <- mcmc_intervals(flat.fit, 
+                                pars = wanted.parameters(flat.fit),
+                                point_est = "mean",
+                                point_size = 1.5,
+                                prob = 0.5,
+                                prob_outer = 0.95) +
+                 theme(axis.title.y = element_blank(),
+                       axis.text.y = element_blank(),
+                       axis.ticks.y = element_blank(),
+                       plot.title = element_text(size = 10, hjust = 0.5)) +                    
+                 ggtitle("Model C")
+
+# color_scheme_set("yellow")
+# informative.interval <- mcmc_intervals(informative.fit, 
+#                                 pars = wanted.parameters(informative.fit),
+#                                 point_est = "mean",
+#                                 point_size = 2,
+#                                 prob = 0.5,
+#                                 prob_outer = 0.95) +
+#                  theme(axis.title.y = element_blank(),
+#                        axis.text.y = element_blank(),
+#                        axis.ticks.y = element_blank()) + 
+#                     xlim(-11, 11)
+
+
+pooled.interval
+ridge.interval
+flat.interval
+
+grid.arrange(pooled.interval, ridge.interval, flat.interval, ncol=3, widths = c(1.1, 1, 1))
+
+```
+
+
+
+Now we begin constructing the multilevel model where we define all the necessary objects for input into R stan
+
+```{r}
+#convert group levels to integers/index
+multi.df <- df
+multi.df[category.predictors[['lv2.id']]] <- lapply(multi.df[category.predictors[['lv2.id']]], as.numeric)
+
+#define the model specification for property-level of multilevel model
+lv1.cont.predictors.spec <- paste(cont.predictors[["lv1"]], collapse = " + ")
+lv1.cont.poly.predictors.spec <- paste("poly(",cont.predictors[["lv1.poly"]],", degree = 5)", collapse = " + ")
+lv1.category.predictors.spec <- paste(category.predictors[["lv1"]], collapse = " + ")
+
+#concatenate all the necessary regressors into a formula to represent the model
+lv1.multi.spec <- paste("logPrice",lv1.cont.predictors.spec, sep = " ~ ")
+lv1.multi.spec <- paste(lv1.multi.spec, lv1.cont.poly.predictors.spec, sep = " + ")
+lv1.multi.spec <- paste(lv1.multi.spec, lv1.category.predictors.spec, sep = " + ")
+lv1.multi.spec <- as.formula(lv1.multi.spec)
+
+#create the X matrix for the property-level of model
+lv1.multi.X <- model.matrix(lv1.multi.spec, data = multi.df)
+
+#create vector for the host-level regressors, grouped by host
+lv2.predictor <- distinct(multi.df, host, .keep_all = T)[cont.predictors[["lv2"]]]
+lv2.predictor <- unlist(lv2.predictor, use.names = F)
+
+#declare the number of groups in the host-level
+num.host <- length(unique(multi.df$host))
+
+
+```
+
+Sample for multilevel model using R stan
+
+```{r}
+#compile all the objects into the data list for R stan input
+multiLevel.data <- list(N = dim(lv1.multi.X)[1],
+                        K_1 = dim(lv1.multi.X)[2],
+                        H = num.host,
+                        log_y = multi.df$logPrice,
+                        X = lv1.multi.X,
+                        z = lv2.predictor,
+                        host = multi.df$host)
+
+start.time <- Sys.time()  
+multiLevel_fit <- stan(file = 'multilevel.stan',
+                       data = multiLevel.data,
+                       init = 0,
+                       chains = 4,     
+                       cores = 4,
+                       iter = 4000,
+                       warmup = 3000,
+                       seed=SEED,
+                       control = list(adapt_delta = 0.999, max_treedepth = 16),
+                       refresh = 100)
+end.time <- Sys.time()
+end.time - start.time
+```
+
+
+
+traceplot(multiLevel_fit,pars=c("omega[3]"))
+pairs(multiLevel_fit, pars = c("Beta[1,3]", "mu_2[4]","mu_1[8]" ,"omega[3]", "sigma"))  
+ 
+
+
+
